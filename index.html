@@ -303,7 +303,12 @@ function doGet(e) {
   const log = sheetToObjects(ss, SHEET_NAME_LOG);
   const foodData = sheetToObjects(ss, SHEET_NAME_DATA);
   const targets = sheetToObjects(ss, SHEET_NAME_TARGET);
-  return ContentService.createTextOutput(JSON.stringify({log, foodData, targets})).setMimeType(ContentService.MimeType.JSON);
+  const json = JSON.stringify({log, foodData, targets});
+  const callback = e && e.parameter && e.parameter.callback;
+  if (callback) {
+    return ContentService.createTextOutput(callback + '(' + json + ')').setMimeType(ContentService.MimeType.JAVASCRIPT);
+  }
+  return ContentService.createTextOutput(json).setMimeType(ContentService.MimeType.JSON);
 }
 
 function sheetToObjects(ss, name) {
@@ -1023,7 +1028,7 @@ async function syncAll() {
     setBadge('ok', 'Synced');
     setTimeout(() => setBadge('ok', '✓'), 1500);
   } catch(e) {
-    setBadge('err', 'Offline');
+    setBadge('err', 'Err: ' + e.message.slice(0,18));
     renderAll();
   }
 }
@@ -1037,12 +1042,51 @@ async function pushLog(entry) {
 async function apiFetch(method, body) {
   const url = state.apiUrl;
   if (!url) return null;
-  const opts = method === 'GET'
-    ? { method: 'GET', redirect: 'follow' }
-    : { method: 'POST', redirect: 'follow', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
-  const res = await fetch(url, opts);
-  if (!res.ok) throw new Error('HTTP ' + res.status);
-  return res.json();
+  if (method === 'GET') {
+    // Apps Script GET redirects to a different origin — must use no-cors mode
+    // but no-cors gives opaque response, so we append a callback to use JSONP,
+    // or better: fetch with mode cors and follow. Try both approaches.
+    try {
+      const res = await fetch(url, { method: 'GET', redirect: 'follow', mode: 'cors' });
+      if (res.ok) return res.json();
+      throw new Error('HTTP ' + res.status);
+    } catch(corsErr) {
+      // Fallback: JSONP-style via script tag
+      return new Promise((resolve, reject) => {
+        const cbName = '_milo_cb_' + Date.now();
+        const script = document.createElement('script');
+        const timeout = setTimeout(() => {
+          document.head.removeChild(script);
+          delete window[cbName];
+          reject(new Error('Timeout'));
+        }, 10000);
+        window[cbName] = (data) => {
+          clearTimeout(timeout);
+          document.head.removeChild(script);
+          delete window[cbName];
+          resolve(data);
+        };
+        script.src = url + (url.includes('?') ? '&' : '?') + 'callback=' + cbName;
+        script.onerror = () => {
+          clearTimeout(timeout);
+          document.head.removeChild(script);
+          delete window[cbName];
+          reject(new Error('Script load failed'));
+        };
+        document.head.appendChild(script);
+      });
+    }
+  } else {
+    const res = await fetch(url, {
+      method: 'POST',
+      redirect: 'follow',
+      mode: 'no-cors',
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify(body)
+    });
+    // no-cors POST returns opaque response — we can't read it but it works
+    return { ok: true };
+  }
 }
 
 function setBadge(type, text) {
