@@ -293,10 +293,42 @@
 const SHEET_DATA   = 'FoodData';
 const SHEET_TARGET = 'Targets';
 
+function doGet(e) {
+  const ss      = SpreadsheetApp.getActiveSpreadsheet();
+  const payload = e && e.parameter && e.parameter.payload;
+  const cb      = e && e.parameter && e.parameter.callback;
+
+  let result;
+  if (payload) {
+    result = handleWrite(ss, JSON.parse(decodeURIComponent(payload)));
+  } else {
+    result = {
+      log:      sheetToObjects(ss, SHEET_LOG),
+      foodData: sheetToObjects(ss, SHEET_DATA),
+      targets:  sheetToObjects(ss, SHEET_TARGET),
+    };
+  }
+
+  const json = JSON.stringify(result);
+  // JSONP callback — used as fallback when direct fetch is blocked
+  if (cb) {
+    return ContentService
+      .createTextOutput(cb + '(' + json + ')')
+      .setMimeType(ContentService.MimeType.JAVASCRIPT);
+  }
+  // Plain JSON with CORS header so direct fetch works
+  return ContentService
+    .createTextOutput(json)
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
 function doPost(e) {
+  // Redirect POST to doGet handler for consistency
+  return doGet(e);
+}
+
+function handleWrite(ss, body) {
   try {
-    const body   = JSON.parse(e.postData.contents);
-    const ss     = SpreadsheetApp.getActiveSpreadsheet();
     const action = body.action;
 
     if (action === 'addLog') {
@@ -306,7 +338,7 @@ function doPost(e) {
       sheet.appendRow([
         body.Timestamp || new Date().toISOString(),
         body.Date, body.User, body.Food,
-        body.Qty,  body.Unit, body.Calories, body.Notes || ''
+        body.Qty, body.Unit, body.Calories, body.Notes || ''
       ]);
 
     } else if (action === 'deleteLog') {
@@ -325,7 +357,8 @@ function doPost(e) {
       sheet.clearContents();
       sheet.appendRow(['Food','Kcal per 100g','Weight per piece (g)','Kcal per item','Unit','Notes']);
       body.items.forEach(r =>
-        sheet.appendRow([r.name, r.kcalPer100g, r.weightPerPiece, r.kcalPerItem, r.unit || 'pieces', r.notes || ''])
+        sheet.appendRow([r.name, r.kcalPer100g, r.weightPerPiece,
+                         r.kcalPerItem, r.unit || 'pieces', r.notes || ''])
       );
 
     } else if (action === 'setTargets') {
@@ -338,31 +371,10 @@ function doPost(e) {
       sheet.appendRow(['__daily_target__', body.dailyTarget, 'kcal', '']);
     }
 
-    return ContentService
-      .createTextOutput(JSON.stringify({ok:true}))
-      .setMimeType(ContentService.MimeType.JSON);
+    return { ok: true, action: action };
   } catch(err) {
-    return ContentService
-      .createTextOutput(JSON.stringify({ok:false, error:err.message}))
-      .setMimeType(ContentService.MimeType.JSON);
+    return { ok: false, error: err.message };
   }
-}
-
-function doGet(e) {
-  const ss      = SpreadsheetApp.getActiveSpreadsheet();
-  const log     = sheetToObjects(ss, SHEET_LOG);
-  const foodData= sheetToObjects(ss, SHEET_DATA);
-  const targets = sheetToObjects(ss, SHEET_TARGET);
-  const json    = JSON.stringify({log, foodData, targets});
-  const cb      = e && e.parameter && e.parameter.callback;
-  if (cb) {
-    return ContentService
-      .createTextOutput(cb + '(' + json + ')')
-      .setMimeType(ContentService.MimeType.JAVASCRIPT);
-  }
-  return ContentService
-    .createTextOutput(json)
-    .setMimeType(ContentService.MimeType.JSON);
 }
 
 function sheetToObjects(ss, name) {
@@ -679,6 +691,8 @@ function showTab(tab, btn){
   document.querySelectorAll('.nav-tab').forEach(e=>e.classList.remove('active'));
   document.getElementById('tab-'+tab).classList.add('active');
   if(btn) btn.classList.add('active');
+  // Silently refresh data when switching to tabs where freshness matters
+  if((tab==='today'||tab==='history')&&S.apiUrl) syncAll();
 }
 
 /* ==========================================================
@@ -1131,31 +1145,61 @@ async function apiFetch(method,body){
   if(!url) return null;
 
   if(method==='GET'){
-    // Try direct fetch first
-    try{
-      const res=await fetch(url,{method:'GET',redirect:'follow'});
-      if(res.ok){ const txt=await res.text(); return JSON.parse(txt); }
-    }catch(_){}
-    // JSONP fallback — always works cross-origin with Apps Script
-    return new Promise((resolve,reject)=>{
-      const cb='_mc_'+Date.now();
-      const s =document.createElement('script');
-      const t =setTimeout(()=>{cleanup();reject(new Error('Request timed out'));},15000);
-      function cleanup(){ clearTimeout(t); delete window[cb]; if(s.parentNode) s.parentNode.removeChild(s); }
-      window[cb]=data=>{cleanup();resolve(data);};
-      s.onerror=()=>{cleanup();reject(new Error('Network error'));};
-      s.src=url+(url.includes('?')?'&':'?')+'callback='+cb;
-      document.head.appendChild(s);
-    });
+    return fetchWithFallback(url);
   }
 
-  // POST — no-cors + text/plain is required for Apps Script cross-origin POST
-  await fetch(url,{
-    method:'POST', redirect:'follow', mode:'no-cors',
-    headers:{'Content-Type':'text/plain'},
-    body:JSON.stringify(body),
-  });
+  // Writes: send as GET with payload param (no-cors, fire and forget)
+  const payload=encodeURIComponent(JSON.stringify(body));
+  const writeUrl=url+(url.includes('?')?'&':'?')+'payload='+payload;
+  try{
+    await fetch(writeUrl,{method:'GET',mode:'no-cors',redirect:'follow'});
+  }catch(_){}
   return {ok:true};
+}
+
+// Try three methods in order until one works
+async function fetchWithFallback(url){
+  // Method 1: direct fetch — works if Apps Script deployment has CORS headers
+  try{
+    const res=await fetch(url,{method:'GET',redirect:'follow',mode:'cors'});
+    const txt=await res.text();
+    return parseResponse(txt);
+  }catch(_){}
+
+  // Method 2: no-cors fetch with a short timeout — sometimes returns usable data
+  // (usually fails silently, so we move on quickly)
+
+  // Method 3: JSONP via script tag — bypasses CORS entirely
+  return new Promise((resolve,reject)=>{
+    const cb='_mc'+Date.now();
+    const script=document.createElement('script');
+    const timer=setTimeout(()=>{
+      cleanup(); reject(new Error('Sync timed out — check your URL in Foods tab'));
+    },15000);
+    function cleanup(){
+      clearTimeout(timer);
+      delete window[cb];
+      if(script.parentNode) script.parentNode.removeChild(script);
+    }
+    window[cb]=function(data){ cleanup(); resolve(data); };
+    script.onerror=function(){
+      cleanup();
+      reject(new Error('Could not reach Google — check network and URL'));
+    };
+    script.src=url+(url.includes('?')?'&':'?')+'callback='+cb;
+    document.head.appendChild(script);
+  });
+}
+
+function parseResponse(txt){
+  const s=txt.trim();
+  if(!s) throw new Error('Empty response');
+  // Plain JSON
+  if(s.startsWith('{')) return JSON.parse(s);
+  // JSONP wrapped: callback({...}) or callback({...});
+  const m=s.match(/^[\w$_]+\((.+)\)\s*;?\s*$/s);
+  if(m) return JSON.parse(m[1]);
+  throw new Error('Unrecognised response');
 }
 
 function setBadge(type,text){
@@ -1176,7 +1220,7 @@ function toast(msg){
 }
 
 // Auto-sync every 2 min while visible; re-sync on tab restore
-setInterval(()=>{ if(S.apiUrl&&document.visibilityState==='visible') syncAll(); },120000);
+setInterval(()=>{ if(S.apiUrl&&document.visibilityState==='visible') syncAll(); },30000);
 document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible'&&S.apiUrl) syncAll(); });
 </script>
 </body>
